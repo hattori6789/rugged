@@ -551,18 +551,31 @@ static VALUE rb_git_blob_to_buffer(int argc, VALUE *argv, VALUE self)
 	return rb_ret;
 }
 
-static void rugged_parse_merge_file_input(git_merge_file_input *input, VALUE rb_input)
+static int rugged_parse_merge_file_input(git_merge_file_input *input, git_blob **blob, git_repository *repo, VALUE rb_input)
 {
 	VALUE rb_value;
+	int error = 0;
 
 	Check_Type(rb_input, T_HASH);
 
-	rb_value = rb_hash_aref(rb_input, CSTR2SYM("content"));
-	if (NIL_P(rb_value))
-		rb_raise(rb_eArgError, "File input must have `:content`.");
+	if (!NIL_P(rb_value = rb_hash_aref(rb_input, CSTR2SYM("content")))) {
+		input->ptr = RSTRING_PTR(rb_value);
+		input->size = RSTRING_LEN(rb_value);
+	} else if (!NIL_P(rb_value = rb_hash_aref(rb_input, CSTR2SYM("oid")))) {
+		git_oid id;
 
-	input->ptr = RSTRING_PTR(rb_value);
-	input->size = RSTRING_LEN(rb_value);
+		if (!repo)
+			rb_raise(rb_eArgError, "Rugged repository is required when file input is `:oid`.");
+
+		if ((error = git_oid_fromstr(&id, RSTRING_PTR(rb_value))) < 0 ||
+			(error = git_blob_lookup(blob, repo, &id)) < 0)
+			return error;
+
+		input->ptr = git_blob_rawcontent(*blob);
+		input->size = git_blob_rawsize(*blob);
+	} else {
+		rb_raise(rb_eArgError, "File input must have `:content` or `:oid`.");
+	}
 
 	rb_value = rb_hash_aref(rb_input, CSTR2SYM("filemode"));
 	if (!NIL_P(rb_value))
@@ -573,33 +586,50 @@ static void rugged_parse_merge_file_input(git_merge_file_input *input, VALUE rb_
 		Check_Type(rb_value, T_STRING);
 		input->path = RSTRING_PTR(rb_value);
 	}
+
+	return error;
 }
 
 static VALUE rb_git_blob_merge_files(int argc, VALUE *argv, VALUE klass)
 {
-	VALUE rb_ancestor, rb_ours, rb_theirs, rb_options, rb_result;
+	VALUE rb_repo, rb_ancestor, rb_ours, rb_theirs, rb_options, rb_result;
 
+	git_repository *repo = NULL;
 	git_merge_file_input ancestor = GIT_MERGE_FILE_INPUT_INIT,
 		ours = GIT_MERGE_FILE_INPUT_INIT,
 		theirs = GIT_MERGE_FILE_INPUT_INIT;
+	git_blob *ancestor_blob = NULL, *our_blob = NULL, *their_blob = NULL;
 	git_merge_file_options opts = GIT_MERGE_FILE_OPTIONS_INIT;
 	git_merge_file_result result = {0};
 	int error;
 
-	rb_scan_args(argc, argv, "31", &rb_ancestor, &rb_ours, &rb_theirs, &rb_options);
+	rb_scan_args(argc, argv, "41", &rb_repo, &rb_ancestor, &rb_ours, &rb_theirs, &rb_options);
 
-	rugged_parse_merge_file_input(&ancestor, rb_ancestor);
-	rugged_parse_merge_file_input(&ours, rb_ours);
-	rugged_parse_merge_file_input(&theirs, rb_theirs);
+	if (!NIL_P(rb_repo)) {
+		rugged_check_repo(rb_repo);
+		Data_Get_Struct(rb_repo, git_repository, repo);
+	}
+
+	if ((error = rugged_parse_merge_file_input(&ancestor, &ancestor_blob, repo, rb_ancestor)) < 0 ||
+		(error = rugged_parse_merge_file_input(&ours, &our_blob, repo, rb_ours)) < 0 ||
+		(error = rugged_parse_merge_file_input(&theirs, &their_blob, repo, rb_theirs)) < 0)
+		goto done;
 
 	if (!NIL_P(rb_options))
 		rugged_parse_merge_file_options(&opts, rb_options);
 
-	rugged_exception_check(git_merge_file(&result, &ancestor, &ours, &theirs, &opts));
+	if ((error = git_merge_file(&result, &ancestor, &ours, &theirs, &opts)) < 0)
+		goto done;
 
 	rb_result = rb_merge_file_result_fromC(&result);
+
+done:
+	git_blob_free(ancestor_blob);
+	git_blob_free(our_blob);
+	git_blob_free(their_blob);
 	git_merge_file_result_free(&result);
 
+	rugged_exception_check(error);
 	return rb_result;
 }
 
